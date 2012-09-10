@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+
+# gitolite-monkeysphere-update: Update Gitolite's SSH keys from PGP keys
+#
+# Written by Etienne Perot <etienne@perot.me>
+#
+# Heavily based off the monkeysphere scripts, written by:
+# Jameson Rollins <jrollins@finestructure.net>
+# Jamie McClelland <jm@mayfirst.org>
+# Daniel Kahn Gillmor <dkg@fifthhorseman.net>
+# Micah Anderson <micah@riseup.net>
+#
+# Copyright 2012, released under the GPL version 3 or later.
+
+########################################################################
+set -e
+
+# set the pipefail option so pipelines fail on first command failure
+set -o pipefail
+
+FULLPGRM="`realpath "$0"`"
+PGRM="`basename "$0"`"
+
+SUDOERSFILE=${GITOLITE_MONKEYSPHERE_SUDOERS:-"/etc/sudoers"}
+SYSSHAREDIR=${MONKEYSPHERE_SYSSHAREDIR:-"__SYSSHAREDIR_PREFIX__/share/monkeysphere"}
+export SYSSHAREDIR
+. "${SYSSHAREDIR}/defaultenv"
+. "${SYSSHAREDIR}/common"
+
+# sharedir for authentication functions
+MASHAREDIR="${SYSSHAREDIR}/ma"
+
+# datadir for authentication functions
+MADATADIR="${SYSDATADIR}/authentication"
+
+# temp directory to enable atomic moves of authorized_keys files
+MATMPDIR="${MADATADIR}/tmp"
+export MATMPDIR
+
+# UTC date in ISO 8601 format if needed
+DATE=$(date -u '+%FT%T')
+
+GITOLITE_ADMIN_REPOSITORY_SUFFIX="repositories/gitolite-admin.git"
+GITOLITE_CONFIG_SUFFIX=".gitolite.rc"
+GITOLITE_LIB_DIR="`gitolite query-rc -n GL_BINDIR`" # Yes, BINDIR
+GITOLITE_TRIGGERS_DIR="$GITOLITE_LIB_DIR/triggers"
+
+# unset some environment variables that could screw things up
+unset GREP_OPTIONS
+
+########################################################################
+# FUNCTIONS
+########################################################################
+
+usage() {
+    cat <<EOF >&2
+usage: $PGRM gitolite-install-directory
+Gitolite-Monkeysphere integration tool.
+
+Simply specify the path to the Gitolite installation as argument.
+This directory should contain the "repositories" directory.
+
+This tool should be run as root.
+If it isn't run as root, it will attempt use sudo to run as root.
+The sudoers file will automatically be updated to allow this.
+
+See ${PGRM}(8) for more info.
+EOF
+}
+
+# Function to interact with the gpg core keyring
+gpg_core() {
+	GNUPGHOME="$GNUPGHOME_CORE"
+	export GNUPGHOME
+	gpg --fixed-list-mode --no-greeting --quiet --no-tty "$@"
+}
+
+# Function to interact with the gpg sphere keyring
+gpg_sphere() {
+	GNUPGHOME="$GNUPGHOME_SPHERE"
+	export GNUPGHOME
+	su_monkeysphere_user "gpg --fixed-list-mode --no-greeting --quiet --no-tty $@"
+}
+
+# Output to stdout the core fingerprint from the gpg core secret keyring
+core_fingerprint() {
+	log debug "determining core key fingerprint..."
+	gpg_core --list-secret-key --with-colons \
+		--with-fingerprint \
+		| grep ^fpr: | cut -d: -f10
+}
+
+# Export signatures from core to sphere
+gpg_core_sphere_sig_transfer() {
+	log debug "exporting core local sigs to sphere..."
+	gpg_core --export-options export-local-sigs --export | \
+		gpg_sphere --import-options import-local-sigs --import 2>&1 | log debug
+}
+
+########################################################################
+# MAIN
+########################################################################
+
+# load configuration file
+[ -e ${MONKEYSPHERE_AUTHENTICATION_CONFIG:="${SYSCONFIGDIR}/monkeysphere-authentication.conf"} ] \
+    && . "$MONKEYSPHERE_AUTHENTICATION_CONFIG"
+
+# set empty config variable with ones from the environment
+LOG_LEVEL=${MONKEYSPHERE_LOG_LEVEL:=$LOG_LEVEL}
+KEYSERVER=${MONKEYSPHERE_KEYSERVER:=$KEYSERVER}
+CHECK_KEYSERVER=${MONKEYSPHERE_CHECK_KEYSERVER:=$CHECK_KEYSERVER}
+MONKEYSPHERE_USER=${MONKEYSPHERE_MONKEYSPHERE_USER:=$MONKEYSPHERE_USER}
+MONKEYSPHERE_GROUP=$(get_primary_group "$MONKEYSPHERE_USER")
+PROMPT=${MONKEYSPHERE_PROMPT:=$PROMPT}
+AUTHORIZED_USER_IDS=${MONKEYSPHERE_AUTHORIZED_USER_IDS:=$AUTHORIZED_USER_IDS}
+RAW_AUTHORIZED_KEYS=${MONKEYSPHERE_RAW_AUTHORIZED_KEYS:=$RAW_AUTHORIZED_KEYS}
+STRICT_MODES=${MONKEYSPHERE_STRICT_MODES:=$STRICT_MODES}
+
+# other variables
+REQUIRED_USER_KEY_CAPABILITY=${MONKEYSPHERE_REQUIRED_USER_KEY_CAPABILITY:="a"}
+GNUPGHOME_CORE=${MONKEYSPHERE_GNUPGHOME_CORE:="${MADATADIR}/core"}
+GNUPGHOME_SPHERE=${MONKEYSPHERE_GNUPGHOME_SPHERE:="${MADATADIR}/sphere"}
+CORE_KEYLENGTH=${MONKEYSPHERE_CORE_KEYLENGTH:="2048"}
+LOG_PREFIX=${MONKEYSPHERE_LOG_PREFIX:='gitolite-ms: '}
+
+# export variables needed in su invocation
+export DATE
+export LOG_LEVEL
+export KEYSERVER
+export MONKEYSPHERE_USER
+export MONKEYSPHERE_GROUP
+export PROMPT
+export CHECK_KEYSERVER
+export REQUIRED_USER_KEY_CAPABILITY
+export GNUPGHOME_CORE
+export GNUPGHOME_SPHERE
+export GNUPGHOME
+export CORE_KEYLENGTH
+export LOG_PREFIX
+
+if [ "$#" -eq 0 ] ; then 
+    usage
+    failure "Please specify the path to the Gitolite installation."
+fi
+
+# Check if we are root, otherwise sudo ourselves
+if [[ "$EUID" -ne 0 ]]; then
+	exec sudo -n "$0" "$@"
+fi
+
+# Get installation directory
+GITOLITE_INSTALLATION_DIRECTORY="$1"
+
+# Do some tests on it
+if [ ! -d "$GITOLITE_INSTALLATION_DIRECTORY" ]; then
+	failure "$GITOLITE_INSTALLATION_DIRECTORY: Does not exist or is not a directory."
+fi
+
+# Get absolute path
+GITOLITE_INSTALLATION_DIRECTORY="`cd "$GITOLITE_INSTALLATION_DIRECTORY" && pwd`"
+
+if [ ! -d "$GITOLITE_INSTALLATION_DIRECTORY/$GITOLITE_ADMIN_REPOSITORY_SUFFIX" ]; then
+	failure "$GITOLITE_ADMIN_REPOSITORY_SUFFIX was not found in the provided installation directory."
+fi
+
+if [ ! -f "$GITOLITE_INSTALLATION_DIRECTORY/$GITOLITE_CONFIG_SUFFIX" ]; then
+	failure "$GITOLITE_CONFIG_SUFFIX was not found in the provided installation directory."
+fi
+GITOLITE_USER="`stat --print='%U' "$GITOLITE_INSTALLATION_DIRECTORY/$GITOLITE_CONFIG_SUFFIX"`"
+GITOLITE_GROUP="`stat --print='%G' "$GITOLITE_INSTALLATION_DIRECTORY/$GITOLITE_CONFIG_SUFFIX"`"
+GITOLITE_USERGROUP="$GITOLITE_USER:$GITOLITE_GROUP"
+
+su_gitolite_user() {
+	su "$GITOLITE_USER" -c '"$0" "$@"' -- "$@"
+}
+
+ensure_gitolite_integration_installed() {
+	local gitoliteInstallationDirectory="$1"
+	local gitoliteConfig="$gitoliteInstallationDirectory/$GITOLITE_CONFIG_SUFFIX"
+	local integrationDirectory="$gitoliteInstallationDirectory/.monkeysphere-integration"
+	local gitoliteInstallationDirectoryChecksum="`echo "$gitoliteInstallationDirectory" | sha1sum | cut -d ' ' -f 1`"
+	local updateHook="gitolite-monkeysphere-update-hook-$gitoliteInstallationDirectoryChecksum"
+	local integrationDirectoryHook="$integrationDirectory/$updateHook"
+	local libDirectoryHook="$GITOLITE_TRIGGERS_DIR/post-compile/$updateHook"
+	su_gitolite_user mkdir -p "$integrationDirectory"
+	# Make git hook script
+	integrationDirectoryHook="`realpath "$integrationDirectoryHook"`"
+	if [ ! -x "$integrationDirectoryHook" ]; then
+		# Create hook script
+		echo "#!/usr/bin/env bash" | su_gitolite_user tee "$integrationDirectoryHook" >/dev/null
+		echo 'exec '"`printf '"%q"' "$FULLPGRM"`"' '"`printf '"%q"' "$gitoliteInstallationDirectory"`" | su_gitolite_user tee -a "$integrationDirectoryHook" >/dev/null
+		chmod +x "$integrationDirectoryHook"
+	fi
+	escapedIntegrationDirectoryHook="`printf "'%q'" "$integrationDirectoryHook"`"
+	if ! grep "$escapedIntegrationDirectoryHook" "$gitoliteConfig" >/dev/null; then
+		if sed -r ":a;N;\$!ba;s%(POST_COMPILE\\s*=>\\s*\\[)(\\s*)'%\1\2'post-compile/$updateHook',\2'%" "$gitoliteConfig" > "$gitoliteConfig.new"; then
+			chown --reference="$gitoliteConfig" "$gitoliteConfig.new"
+			chmod --reference="$gitoliteConfig" "$gitoliteConfig.new"
+			mv -f "$gitoliteConfig.new" "$gitoliteConfig"
+		else
+			log error "Error while installing git hook: Match failed."
+			rm -f "$gitoliteConfig.new"
+			return 1
+		fi
+	fi
+	# Make sure the hook is properly linked in the triggers/post-compile directory
+	if [ ! -e "$libDirectoryHook" ]; then
+		ln -s "$integrationDirectoryHook" "$libDirectoryHook"
+	fi
+	# Ensure git user can sudo to root when running the hook script
+	if [ ! -f "$SUDOERSFILE" ]; then
+		log error "$SUDOERSFILE: Sudoers file not found."
+		log error "You can set GITOLITE_MONKEYSPHERE_SUDOERS to override the location."
+		return 1
+	fi
+	if ! grep 'Required for gitolite-monkeysphere-integration git hook' "$SUDOERSFILE" | grep "$FULLPGRM" >/dev/null; then
+		echo "Attention: Your sudoers file ($SUDOERSFILE) is being modified!" >&2
+		echo "A rule is being added to allow the git user ($GITOLITE_USER) to run the update script." >&2
+		echo "Make sure you are comfortable with this." >&2
+		echo "If you are not, comment the line by adding '#' in front of it." >&2
+		echo "Do not delete the line, or it will be readded next time this script is run." >&2
+		echo '' >> "$SUDOERSFILE" # Blank line
+		echo "$GITOLITE_USER ALL = NOPASSWD: $FULLPGRM # Required for gitolite-monkeysphere-integration git hook" >> "$SUDOERSFILE"
+	fi
+}
+
+update_gitolite_keys() {
+	local previousDir="`pwd`"
+	local gitoliteInstallationDirectory="$1"
+	local integrationDirectory="$gitoliteInstallationDirectory/.monkeysphere-integration"
+	local integrationDirectoryRepository="$integrationDirectory/admin-clone"
+	local integrationDirectoryRepositorySSHDir="keydir/monkeysphere"
+	local integrationDirectoryMonkeys="$integrationDirectory/monkeys.list"
+	local monkey # Banana
+	local monkeyFile
+	local monkeyOldKey
+	local monkeyOldKeys=()
+	local monkeyNewKeys=()
+	local monkeySSHFile
+	local monkeySSHKey
+	local processedMonkeys=()
+	local newMonkeys=()
+	local previousMonkeys=()
+	local skip
+	local singleKey
+	# Set gnupg home
+	GNUPGHOME="$GNUPGHOME_SPHERE"
+	# Check to see if the gpg trust database has been initialized
+	if [ ! -s "${GNUPGHOME}/trustdb.gpg" ] ; then
+		failure "GNUPG trust database uninitialized.  Please see MONKEYSPHERE-SERVER(8)."
+	fi
+	su_gitolite_user mkdir -p "$integrationDirectory"
+	cd "$integrationDirectory"
+	if [ -d "$integrationDirectoryRepository" ]; then
+		# Pull potential changes in existing clone
+		cd "$integrationDirectoryRepository"
+		if ! su_gitolite_user git pull; then
+			# Probably got a merge conflict or something. Better to just re-clone it.
+			# The admin repo is usually pretty small so this shouldn't be a problem.
+			cd "$integrationDirectory"
+			rm -rf "$integrationDirectoryRepository" # This will cause the repository to be cloned again a few lines below
+		fi
+	fi
+	if [ ! -d "$integrationDirectoryRepository" ]; then
+		# Make new clone.
+		if ! su_gitolite_user git clone "file://$gitoliteInstallationDirectory/$GITOLITE_ADMIN_REPOSITORY_SUFFIX" "$integrationDirectoryRepository"; then
+			failure "Cannot clone file://$gitoliteInstallationDirectory/$GITOLITE_ADMIN_REPOSITORY_SUFFIX!"
+		fi
+		cd "$integrationDirectoryRepository"
+		# Set local repo author configuration
+		su_gitolite_user git config user.email "gitolite-monkeysphere-integration@`hostname`"
+		su_gitolite_user git config user.name "Gitolite-Monkeysphere integration"
+		# Make sure the monkeysphere directory exists in keydir
+		if [ ! -d "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir" ]; then
+			log debug "Creating directory inside keydir: $integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir"
+			su_gitolite_user mkdir -p "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir"
+			su_gitolite_user git add "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir"
+			su_gitolite_user git commit -m 'Added monkeysphere directory in gitolite-admin/keydir. Keys from Monkeysphere will be stored there.'
+			if ! su_gitolite_user gitolite push; then
+				log error "Error while pushing to gitolite-admin repo."
+				log error "Deleting the admin repository clone."
+				cd "$integrationDirectory"
+				rm -rf "$integrationDirectoryRepository"
+				return 1
+			fi
+		fi
+	fi
+	if [ -f "$integrationDirectoryMonkeys" ]; then
+		previousMonkeys=($(<"$integrationDirectoryMonkeys"))
+		rm -f "$integrationDirectoryMonkeys"
+	fi
+	if [ -d "$integrationDirectoryRepository/monkeydir" ]; then
+		while IFS= read -d $'\0' -r monkeyFile; do
+			monkey="`basename "$monkeyFile" | sed 's%\.[^.]*$%%'`"
+			log verbose "Processing $monkey from $monkeyFile..."
+			monkeyOldKeys=()
+			monkeyNewKeys=()
+			# Populate old keys
+			while IFS= read -d $'\0' -r monkeyOldKey; do
+				monkeyOldKeys+=("$monkeyOldKey")
+			done < <(find "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir" -type f -name "$monkey.pub" -print0)
+			monkeySSHKeys="`su_monkeysphere_user \
+				". ${SYSSHAREDIR}/common; STRICT_MODES='$STRICT_MODES' process_authorized_user_ids -" \
+				< "$monkeyFile"`"
+			if [ -n "$monkeySSHKeys" ]; then
+				# Add monkey to list
+				newMonkeys+=("$monkey")
+				# Get rid of Monkeysphere timestamps and replace them by the monkey username
+				monkeySSHKeys="`echo "$monkeySSHKeys" | sed 's/MonkeySphere[-0-9]*T[:0-9]*/MonkeySphere-'"$monkey"'/'`"
+				# Write them out
+				while read -r singleKey; do
+					if [ -n "$singleKey" ]; then
+						log verbose "Adding SSH key $singleKey..."
+						monkeySSHDir="$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir/monkey-`echo "$singleKey" | sha1sum | cut -d ' ' -f 1`"
+						if [ ! -d "$monkeySSHDir" ]; then
+							su_gitolite_user mkdir -p "$monkeySSHDir"
+							su_gitolite_user git add "$monkeySSHDir"
+						fi
+						monkeySSHFile="$monkeySSHDir/$monkey.pub"
+						echo "$singleKey" | su_gitolite_user tee "$monkeySSHFile" >/dev/null
+						su_gitolite_user git add "$monkeySSHFile"
+						monkeyNewKeys+=("$monkeySSHFile")
+					fi
+				done <<< "$monkeySSHKeys"
+			fi
+			# Remove old keys
+			for oldKey in "${monkeyOldKeys[@]}"; do
+				skip=
+				for newKey in "${monkeyNewKeys[@]}"; do
+					if [ "$oldKey" == "$newKey" ]; then
+						skip=1
+						break
+					fi
+				done
+				if [ -z "$skip" ]; then
+					# This key got deleted.
+					log verbose "Deleting key: $oldKey"
+					cd "$integrationDirectoryRepository"
+					su_gitolite_user git rm -r "`dirname "$oldKey"`"
+				fi
+			done
+		done < <(find "$integrationDirectoryRepository/monkeydir" -type f -print0)
+	fi
+	for oldMonkey in "${previousMonkeys[@]}"; do
+		skip=
+		for newMonkey in "${newMonkeys[@]}"; do
+			if [ "$oldMonkey" == "$newMonkey" ]; then
+				skip=1
+				break
+			fi
+		done
+		if [ -z "$skip" ]; then
+			# Monkey got deleted.
+			cd "$integrationDirectoryRepository"
+			while IFS= read -d $'\0' -r monkeyFile; do
+				su_gitolite_user git rm -r --ignore-unmatch "`dirname "$monkeyFile"`"
+			done < <(find "$integrationDirectoryRepositorySSHDir" -type f -name "$oldMonkey.pub" -print0)
+		fi
+	done
+	for newMonkey in "${newMonkeys[@]}"; do
+		echo "$newMonkey" >> "$integrationDirectoryMonkeys"
+	done
+	if [ -n "$(git status --porcelain)" ]; then
+		# Changes to commit
+		log verbose "Committing changes to gitolite-admin repository."
+		su_gitolite_user git commit -m "Gitolite-Monkeysphere integration: Keys updated on `date`."
+		if ! su_gitolite_user gitolite push; then
+			log error "Error while pushing to gitolite-admin repo."
+			log error "Deleting the admin repository clone."
+			log error "It will be recreated next time the script runs."
+			cd "$integrationDirectory"
+			rm -rf "$integrationDirectoryRepository"
+		fi
+	fi
+}
+
+# Let's do it
+source "${MASHAREDIR}/setup"
+log debug "Setting up..."
+setup
+log debug "Updating keyring..."
+gpg_sphere --keyserver "$KEYSERVER" --refresh-keys
+log debug "Ensure the hook is properly set up..."
+if ! OUTPUT_STDOUT= ensure_gitolite_integration_installed "$GITOLITE_INSTALLATION_DIRECTORY"; then
+	failure "Error while setting up git repository hook. Aborting."
+fi
+log debug "Updating gitolite keys..."
+OUTPUT_STDOUT= update_gitolite_keys "$GITOLITE_INSTALLATION_DIRECTORY"
