@@ -191,8 +191,7 @@ ensure_gitolite_integration_installed() {
 		echo 'exec '"`printf '"%q"' "$FULLPGRM"`"' '"`printf '"%q"' "$gitoliteInstallationDirectory"`" | su_gitolite_user tee -a "$integrationDirectoryHook" >/dev/null
 		chmod +x "$integrationDirectoryHook"
 	fi
-	escapedIntegrationDirectoryHook="`printf "'%q'" "$integrationDirectoryHook"`"
-	if ! grep "$escapedIntegrationDirectoryHook" "$gitoliteConfig" >/dev/null; then
+	if ! grep "$updateHook" "$gitoliteConfig" >/dev/null; then
 		if sed -r ":a;N;\$!ba;s%(POST_COMPILE\\s*=>\\s*\\[)(\\s*)'%\1\2'post-compile/$updateHook',\2'%" "$gitoliteConfig" > "$gitoliteConfig.new"; then
 			chown --reference="$gitoliteConfig" "$gitoliteConfig.new"
 			chmod --reference="$gitoliteConfig" "$gitoliteConfig.new"
@@ -218,7 +217,7 @@ ensure_gitolite_integration_installed() {
 		echo "A rule is being added to allow the git user ($GITOLITE_USER) to run the update script." >&2
 		echo "Make sure you are comfortable with this." >&2
 		echo "If you are not, comment the line by adding '#' in front of it." >&2
-		echo "Do not delete the line, or it will be readded next time this script is run." >&2
+		echo "Do not delete the line, otherwise it will be readded next time this script is run." >&2
 		echo '' >> "$SUDOERSFILE" # Blank line
 		echo "$GITOLITE_USER ALL = NOPASSWD: $FULLPGRM # Required for gitolite-monkeysphere-integration git hook" >> "$SUDOERSFILE"
 	fi
@@ -288,6 +287,21 @@ update_gitolite_keys() {
 	if [ -f "$integrationDirectoryMonkeys" ]; then
 		previousMonkeys=($(<"$integrationDirectoryMonkeys"))
 		rm -f "$integrationDirectoryMonkeys"
+	fi
+	if [ -d "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir" ]; then
+		while IFS= read -d $'\0' -r monkeyOldKey; do
+			monkey="`basename "$monkeyOldKey" | sed 's/\.pub$//'`"
+			skip=
+			for oldMonkey in "${previousMonkeys[@]}"; do
+				if [ "$oldMonkey" == "$monkey" ]; then
+					skip=1
+					break
+				fi
+			done
+			if [ -z "$skip" ]; then
+				previousMonkeys+=("$monkey")
+			fi
+		done < <(find "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir" -type f -name '*.pub' -print0)
 	fi
 	if [ -d "$integrationDirectoryRepository/monkeydir" ]; then
 		while IFS= read -d $'\0' -r monkeyFile; do
@@ -360,7 +374,7 @@ update_gitolite_keys() {
 	for newMonkey in "${newMonkeys[@]}"; do
 		echo "$newMonkey" >> "$integrationDirectoryMonkeys"
 	done
-	if [ -n "$(git status --porcelain)" ]; then
+	if [ -n "$(su_gitolite_user git status --porcelain)" ]; then
 		# Changes to commit
 		log verbose "Committing changes to gitolite-admin repository."
 		su_gitolite_user git commit -m "Gitolite-Monkeysphere integration: Keys updated on `date`."
