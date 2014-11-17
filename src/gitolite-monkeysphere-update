@@ -79,7 +79,7 @@ gpg_core() {
 gpg_sphere() {
 	GNUPGHOME="$GNUPGHOME_SPHERE"
 	export GNUPGHOME
-	su_monkeysphere_user "gpg --fixed-list-mode --no-greeting --quiet --no-tty $@"
+	su_monkeysphere_user gpg --fixed-list-mode --no-greeting --quiet --no-tty $@
 }
 
 # Output to stdout the core fingerprint from the gpg core secret keyring
@@ -314,7 +314,7 @@ update_gitolite_keys() {
 				monkeyOldKeys+=("$monkeyOldKey")
 			done < <(find "$integrationDirectoryRepository/$integrationDirectoryRepositorySSHDir" -type f -name "$monkey.pub" -print0)
 			monkeySSHKeys="`su_monkeysphere_user \
-				". ${SYSSHAREDIR}/common; STRICT_MODES='$STRICT_MODES' process_authorized_user_ids -" \
+				bash -c ". ${SYSSHAREDIR}/common; STRICT_MODES='$STRICT_MODES' process_authorized_user_ids -" \
 				< "$monkeyFile"`"
 			if [ -n "$monkeySSHKeys" ]; then
 				# Add monkey to list
